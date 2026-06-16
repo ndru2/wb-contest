@@ -18,6 +18,10 @@ FEATURE_COLUMNS = [
     "load_ratio_lag2",
     "load_ratio_lag3",
     "queue_delta",
+    # Загрузка соседей: узел видит давление «сверху» (склады → хабы) и «снизу» (хабы → ПВЗ).
+    # SHAP сможет объяснять риск через upstream_load, как требует ТЗ.
+    "upstream_load",
+    "downstream_load",
 ]
 
 TARGET_COLUMN = "future_overload"
@@ -60,6 +64,12 @@ class CSVDataLoader(DataLoader):
         df["load_ratio_lag5"] = grp["load_ratio"].shift(5)
         df["queue_delta"]     = df["queue"] - grp["queue"].shift(1)
 
+        # Загрузка соседей: записывается симуляцией в CSV.
+        # Фоллбэк 0.0 для совместимости со старыми CSV-файлами без этих колонок.
+        for col in ("upstream_load", "downstream_load"):
+            if col not in df.columns:
+                df[col] = 0.0
+
         df[TARGET_COLUMN] = grp["is_overload"].shift(-self.forecast_horizon)
 
         df = df.dropna(subset=FEATURE_COLUMNS + [TARGET_COLUMN]).reset_index(drop=True)
@@ -100,6 +110,11 @@ class GraphDataLoader(DataLoader):
             q_prev  = past[-1]["queue"]      if len(past) >= 1 else queue
             queue_delta = queue - q_prev
 
+            pred_lr = [self.graph.nodes[p]["load_ratio"] for p in self.graph.predecessors(node_id)]
+            succ_lr = [self.graph.nodes[s]["load_ratio"] for s in self.graph.successors(node_id)]
+            upstream_load   = sum(pred_lr) / len(pred_lr) if pred_lr else 0.0
+            downstream_load = sum(succ_lr) / len(succ_lr) if succ_lr else 0.0
+
             rows.append({
                 "node_id":          node_id,
                 "node_type_code":   NODE_TYPE_CODE.get(attrs.get("type", ""), -1),
@@ -114,6 +129,8 @@ class GraphDataLoader(DataLoader):
                 "load_ratio_lag2":  lr_lag2,
                 "load_ratio_lag3":  lr_lag3,
                 "queue_delta":      queue_delta,
+                "upstream_load":    upstream_load,
+                "downstream_load":  downstream_load,
             })
 
         return pd.DataFrame(rows)

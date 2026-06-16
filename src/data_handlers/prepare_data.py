@@ -34,4 +34,3 @@ def prepare_simulation_data(df: pd.DataFrame):
     y_test = test_df[TARGET_COLUMN]
 
     return X_train, X_test, y_train, y_test
-
