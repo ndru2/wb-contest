@@ -42,9 +42,9 @@ def _pick_alt_pvz(graph, current_node, pvzs, risk, exclude):
 def simulate_with_dispatcher(
     graph,
     dispatcher=None,
-    n_steps=200,
-    min_orders_per_step=5,
-    max_orders_per_step=20,
+    n_steps=400,
+    min_orders_per_step=15,
+    max_orders_per_step=30,
     reroute_threshold=1.0,
     use_reroute=True,
     use_pvz_switch=True,
@@ -113,6 +113,11 @@ def simulate_with_dispatcher(
             graph.nodes[start]["queue"].append(new_order)
 
         update_node_loads(graph)
+
+        for node in graph.nodes:
+            for order in graph.nodes[node]["queue"]:
+                if not order.delivered and not order.stuck:
+                    order.queue_wait_time += 1
 
         active_orders = sum(1 for o in orders if not o.delivered and not o.stuck)
         delivered_orders = sum(1 for o in orders if o.delivered)

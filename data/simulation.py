@@ -19,6 +19,7 @@ class Order:
     path_index: int = 0
     reroute_count: int = 0
     priority: int = 0
+    queue_wait_time: int = 0
 
     @property
     def current_node(self):
@@ -259,6 +260,10 @@ def simulate(
 
         update_node_loads(graph)
 
+        for node in graph.nodes:
+            for order in graph.nodes[node]["queue"]:
+                if not order.delivered and not order.stuck:
+                    order.queue_wait_time += 1
         incoming = {node: [] for node in graph.nodes}
 
         for node in list(graph.nodes):

@@ -29,7 +29,7 @@ from src.dispatcher.closed_loop import simulate_with_dispatcher
 
 # ── Сеть: узкое место на хабах, просторные склады/ПВЗ, плотные связи ──────────
 NETWORK = dict(
-    n_nodes=39, n_warehouses=5, n_hubs=14, n_pvz=20,
+    n_nodes=85, n_warehouses=10, n_hubs=25, n_pvz=50,
     min_capacity_wh=60, max_capacity_wh=100,
     min_capacity_hub=10, max_capacity_hub=14,
     min_capacity_pvz=60, max_capacity_pvz=90,
@@ -39,22 +39,22 @@ NETWORK = dict(
 
 # ── Режим спроса: умеренная нагрузка + локальные горячие точки ────────────────
 REGIME = dict(
-    min_orders_per_step=50,
-    max_orders_per_step=90,
+    min_orders_per_step=100,
+    max_orders_per_step=150,
     hot_frac=0.3,
     hot_multiplier=3.0,
 )
 
 # Отдельный, более тяжёлый режим ТОЛЬКО для генерации обучающих данных:
 TRAIN_REGIME = dict(
-    min_orders_per_step=60,
-    max_orders_per_step=110,
+    min_orders_per_step=150,
+    max_orders_per_step=250,
     hot_frac=0.4,
     hot_multiplier=4.5,
 )
 N_STEPS = 150
 RISK_THRESHOLD = 0.4
-PROACTIVE_FRACTION = 0.3   # доля рискового потока
+PROACTIVE_FRACTION = 0.2   # доля рискового потока
 RISK_WEIGHT = 10.0         # вес прогноза P(overload) в стоимости рёбер графа (Layer 3)
 EVAL_SEEDS = [1, 2, 3, 4, 5]
 TRAIN_SEED = 100
@@ -78,7 +78,7 @@ def train_model(csv_path):
     model = lgb.LGBMClassifier(
         objective="binary", metric="binary_logloss",
         num_leaves=63, learning_rate=0.05, n_estimators=400,
-        class_weight="balanced", random_state=42, verbose=-1,
+        class_weight="balanced", random_state=42, verbose=1,
     )
     model.fit(X_train, y_train)
     auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])

@@ -16,10 +16,12 @@
 
 import copy
 import random
+import time
 
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 import run_closed_loop as R
 from data.simulation import build_network
@@ -71,11 +73,19 @@ def humanize_rules(tree, feature_names, threshold, max_rules=8):
 VIZ_STEPS = 120
 ORDER_CAP = 70
 VIZ_SEED = 7
+PLOTLY_FRAME_DURATION_MS = 180
 
 EMOJI = {"warehouse": "🏭", "hub": "🏢", "pvz": "🏠"}
 XCOL = {"warehouse": 0.0, "hub": 1.3, "pvz": 2.6}
 SIDE_OFFSET = 4.2
 LOAD_SCALE = [[0.0, "#2ecc71"], [0.5, "#f4d03f"], [1.0, "#e74c3c"]]
+
+
+def init_session_state():
+    if "demo_result" not in st.session_state:
+        st.session_state["demo_result"] = None
+    if "animation_done" not in st.session_state:
+        st.session_state["animation_done"] = False
 
 
 def layout_positions(graph, x_offset):
@@ -101,6 +111,24 @@ def step_index(df):
     return loads, delivered
 
 
+def autoplay_plotly_animation(fig):
+    autoplay_fig = copy.deepcopy(fig)
+    autoplay_fig.update_layout(updatemenus=[], sliders=[])
+    html = autoplay_fig.to_html(
+        full_html=False,
+        include_plotlyjs=True,
+        auto_play=True,
+        animation_opts={
+            "frame": {"duration": PLOTLY_FRAME_DURATION_MS, "redraw": True},
+            "transition": {"duration": 0},
+            "fromcurrent": True,
+        },
+        config={"displayModeBar": False, "responsive": True},
+    )
+    components.html(html, height=680, scrolling=False)
+    return len(autoplay_fig.frames) * PLOTLY_FRAME_DURATION_MS / 1000 + 1.2
+
+
 @st.cache_resource(show_spinner="Готовлю симуляцию и обучаю модели...")
 def build_demo():
     random.seed(0)
@@ -115,8 +143,8 @@ def build_demo():
     # Пассивный режим (без управления)
     g_p = copy.deepcopy(graph)
     log_p = []
-    df_p, orders_p, _ = simulate_with_dispatcher(
-        g_p, dispatcher=None, use_reroute=False,
+    df_p, orders_p, actions_p = simulate_with_dispatcher(
+        g_p, dispatcher=None, use_reroute=True,
         n_steps=VIZ_STEPS, seed=VIZ_SEED,
         order_log=log_p, order_log_cap=ORDER_CAP, **R.REGIME,
     )
@@ -278,6 +306,11 @@ def build_demo():
     # «разбавляют» среднее по всей сети. Поэтому ключевую метрику считаем по хабам.
     hub_p = df_p[df_p["node_type"] == "hub"]
     hub_a = df_a[df_a["node_type"] == "hub"]
+    delivered_p = [o for o in orders_p if o.delivered]
+    delivered_a = [o for o in orders_a if o.delivered]
+
+    mean_queue_wait_p = sum(o.queue_wait_time for o in delivered_p) / max(len(delivered_p), 1)
+    mean_queue_wait_a = sum(o.queue_wait_time for o in delivered_a) / max(len(delivered_a), 1)
     summary = {
         "overload_rate": (float(df_p["is_overload"].mean()), float(df_a["is_overload"].mean())),
         "hub_overload_rate": (float(hub_p["is_overload"].mean()), float(hub_a["is_overload"].mean())),
@@ -285,28 +318,52 @@ def build_demo():
         "mean_hub_load": (float(hub_p["load_ratio"].mean()), float(hub_a["load_ratio"].mean())),
         "delivered": (int(df_p["delivered_orders"].max()), int(df_a["delivered_orders"].max())),
         "created": (len(orders_p), len(orders_a)),
+        "mean_queue_wait": (mean_queue_wait_p, mean_queue_wait_a),
+        "reroutes": (int(actions_p.get("reroute", 0)), int(actions.get("reroute", 0))),
     }
     return fig, rules, human_rules, fidelity, summary, actions
 
 
 def main():
     st.set_page_config(layout="wide", page_title="WB · AI-диспетчер")
+    init_session_state()
+
     st.title("📦 Динамическая симуляция логистики: без диспетчера vs AI-диспетчер")
     st.caption("Домики — узлы сети (🏭 склад · 🏢 хаб · 🏠 ПВЗ). 🚆 — заказы на дорогах. "
-               "💥 — перегрузка узла (queue > capacity). Нажмите ▶ Играть.")
+               "💥 — перегрузка узла (queue > capacity).")
 
-    fig, rules, human_rules, fidelity, summary, actions = build_demo()
+    if st.session_state["demo_result"] is None:
+        with st.spinner("Создаю модель и считаю симуляцию..."):
+            st.session_state["demo_result"] = build_demo()
+
+    fig, rules, human_rules, fidelity, summary, actions = st.session_state["demo_result"]
+
+    if not st.session_state["animation_done"]:
+        duration = autoplay_plotly_animation(fig)
+        time.sleep(duration)
+        st.session_state["animation_done"] = True
+        st.rerun()
+        return
+
+    if st.button("▶ Запустить симуляцию", type="primary"):
+        st.session_state["animation_done"] = False
+        st.rerun()
+
     st.plotly_chart(fig, use_container_width=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     hop, hoa = summary["hub_overload_rate"]
     mlp, mla = summary["mean_hub_load"]
     mxp, mxa = summary["max_load_ratio"]
     dp, da = summary["delivered"]
+    mtp, mta = summary["mean_queue_wait"]
+    rp, ra = summary["reroutes"]
     c1.metric("Перегрузки хабов", f"{hoa:.1%}", f"{(hoa - hop):.1%} vs без AI", delta_color="inverse")
     c2.metric("Средняя загрузка хабов", f"{mla:.2f}", f"{(mla - mlp):.2f} vs без AI", delta_color="inverse")
     c3.metric("Пиковая загрузка", f"{mxa:.2f}×", f"{(mxa - mxp):.2f} vs без AI", delta_color="inverse")
     c4.metric("Доставлено заказов", f"{da}", f"{da - dp} vs без AI")
+    c5.metric("Среднее время в очереди обработки", f"{mta:.2f}", f"{(mta - mtp):.2f} vs без AI", delta_color="inverse")
+    c6.metric("Перемаршруты", f"{ra}", f"без AI: {rp}")
     st.caption("Перегрузки считаются по хабам — это узкое место сети (склады и ПВЗ имеют "
                "запас ёмкости). По всей сети доля перегрузок: "
                f"без AI {summary['overload_rate'][0]:.3f} → с AI {summary['overload_rate'][1]:.3f}.")

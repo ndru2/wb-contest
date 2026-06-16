@@ -40,7 +40,7 @@ class XLSXDataLoader(DataLoader):
 
 
 class CSVDataLoader(DataLoader):
-    def __init__(self, file_path: str, forecast_horizon: int = 3):
+    def __init__(self, file_path: str, forecast_horizon: int = 5):
         self.file_path = file_path
         self.forecast_horizon = forecast_horizon
 
@@ -56,6 +56,8 @@ class CSVDataLoader(DataLoader):
         df["load_ratio_lag1"] = grp["load_ratio"].shift(1)
         df["load_ratio_lag2"] = grp["load_ratio"].shift(2)
         df["load_ratio_lag3"] = grp["load_ratio"].shift(3)
+        df["load_ratio_lag4"] = grp["load_ratio"].shift(4)
+        df["load_ratio_lag5"] = grp["load_ratio"].shift(5)
         df["queue_delta"]     = df["queue"] - grp["queue"].shift(1)
 
         df[TARGET_COLUMN] = grp["is_overload"].shift(-self.forecast_horizon)
