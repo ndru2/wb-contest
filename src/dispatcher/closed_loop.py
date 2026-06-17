@@ -1,196 +1,278 @@
 """
-Пайплайн:
-  1. Генерируем обучающие данные пассивным прогоном (без объездов) — там
-     перегрузки возникают естественно, и модели есть что предсказывать.
-  2. Обучаем LightGBM: P(overload) на прогнозируемый горизонт шагов вперёд.
-  3. На нескольких сценариях (seed) сравниваем 3 режима на одном потоке заказов:
-        passive  — без объездов (что было бы без управления);
-        reactive — объезд по факту пробки (реагируем, когда уже поздно);
-        ai       — объезд по предсказанию модели (+ смена ПВЗ, приоритет).
-  4. Усредняем метрики, печатаем сравнение и SHAP-объяснение.
+Замкнутый управляющий контур: симуляция <-> AI-диспетчер.
 
-Запуск:  python run_closed_loop.py
+Цикл одного шага:
+    1. Симуляция генерирует новые заказы.
+    2. LightGBM предсказывает P(overload) по узлам (через AIDispatcher).
+    3. (SHAP объясняет причины — доступно через dispatcher.explain).
+    4. Диспетчер применяет правила:
+         - reroute        : обойти узел, который предсказан перегруженным (а не уже стоящий в пробке);
+         - смена ПВЗ      : если целевой ПВЗ предсказан перегруженным, перенаправить на менее рискованный;
+         - приоритет      : заказы, идущие в рискованные узлы, обрабатываются первыми.
+    5. Симуляция обновляется, состояние пишется в историю.
+
+Если dispatcher=None — получаем baseline (reroute только по факту пробки),
+что эквивалентно исходной simulate() и служит точкой сравнения.
 """
 
-import copy
 import random
 
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
-from sklearn.tree import DecisionTreeClassifier, export_text
 
-from data.simulation import build_network
-from src.data_handlers.prepare_data import prepare_simulation_data
-from src.data_loaders.loaders import CSVDataLoader
-from src.dispatcher.ai_dispatcher import AIDispatcher
-from src.dispatcher.closed_loop import simulate_with_dispatcher
-
-# ── Сеть: узкое место на хабах, просторные склады/ПВЗ, плотные связи ──────────
-NETWORK = dict(
-    n_nodes=85, n_warehouses=10, n_hubs=25, n_pvz=50,
-    min_capacity_wh=60, max_capacity_wh=100,
-    min_capacity_hub=10, max_capacity_hub=14,
-    min_capacity_pvz=60, max_capacity_pvz=90,
-    warehouse_link_prob=0.6, hub_link_prob=0.8,
-    wh_hub_link_prob=0.9, hub_pvz_link_prob=0.9,
+from data.simulation import (
+    INF,
+    Order,
+    find_path,
+    get_nodes_by_type,
+    update_node_loads,
 )
 
-# ── Режим спроса: умеренная нагрузка + локальные горячие точки ────────────────
-REGIME = dict(
-    min_orders_per_step=100,
-    max_orders_per_step=150,
-    hot_frac=0.4,
-    hot_multiplier=5.0,
-)
 
-# Отдельный, более тяжёлый режим ТОЛЬКО для генерации обучающих данных:
-TRAIN_REGIME = dict(
-    min_orders_per_step=150,
-    max_orders_per_step=250,
-    hot_frac=0.4,
-    hot_multiplier=4.5,
-)
-N_STEPS = 150
-RISK_THRESHOLD = 0.4
-PROACTIVE_FRACTION = 0.35   # доля рискового потока
-RISK_WEIGHT = 3.0         # вес прогноза P(overload) в стоимости рёбер графа (Layer 3)
-EVAL_SEEDS = [1, 2, 3, 4, 5]
-TRAIN_SEED = 100
-TRAIN_STEPS = 500
-TRAIN_CSV = "data/train_sim.csv"
+def _pick_alt_pvz(graph, current_node, pvzs, risk, exclude):
+    base_risk = risk.get(exclude, 0.0)
+    ranked = sorted((p for p in pvzs if p != exclude), key=lambda p: risk.get(p, 1.0))
+    for p in ranked:
+        if risk.get(p, 1.0) >= base_risk:
+            break
+        if find_path(graph, current_node, p, start_search=True) is not None:
+            return p
+    return None
 
 
-def generate_training_data(base_graph):
-    g = copy.deepcopy(base_graph)
-    df, _, _ = simulate_with_dispatcher(
-        g, dispatcher=None, use_reroute=False,
-        n_steps=TRAIN_STEPS, seed=TRAIN_SEED, **TRAIN_REGIME,
-    )
-    df.to_csv(TRAIN_CSV, index=False)
-    return TRAIN_CSV
+def simulate_with_dispatcher(
+    graph,
+    dispatcher=None,
+    n_steps=400,
+    min_orders_per_step=15,
+    max_orders_per_step=30,
+    reroute_threshold=1.0,
+    use_reroute=True,
+    use_pvz_switch=True,
+    use_priority=True,
+    max_pvz_switches=5,
+    block_if_full=False,
+    proactive_reroute_fraction=0.4,
+    risk_weight=0.0,
+    hot_frac=0.0,
+    hot_multiplier=1.0,
+    order_log=None,
+    order_log_cap=150,
+    seed=None,
+):
+    # rng — поток заказов (одинаков во всех режимах при одном seed).
+    # aux_rng — стохастика решений диспетчера и сэмплирование лога, чтобы решения
+    # диспетчера не сдвигали поток заказов (честное сравнение passive/reactive/ai).
+    base_seed = 0 if seed is None else seed
+    rng = random.Random(base_seed)
+    aux_rng = random.Random(base_seed + 10007)
 
+    orders = []
+    history = []
+    order_id = 0
 
-def train_model(csv_path):
-    data = CSVDataLoader(csv_path).load_data()
-    X_train, X_test, y_train, y_test = prepare_simulation_data(data)
-    model = lgb.LGBMClassifier(
-        objective="binary", metric="binary_logloss",
-        num_leaves=63, learning_rate=0.05, n_estimators=400,
-        class_weight="balanced", random_state=42, verbose=1,
-    )
-    model.fit(X_train, y_train)
-    auc = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
-    print(f"[train] overload rate: {y_train.mean():.3f} | holdout ROC-AUC: {auc:.3f}")
-    return model, X_train
+    whs = get_nodes_by_type(graph, "warehouse")
+    pvzs = get_nodes_by_type(graph, "pvz")
 
+    # Неравномерный спрос: фиксированное подмножество горячих ПВЗ получает
+    # повышенный вес => локальные перегрузки при наличии запаса ёмкости в других узлах.
+    pvz_weights = None
+    if hot_frac > 0.0 and hot_multiplier > 1.0:
+        n_hot = max(1, int(len(pvzs) * hot_frac))
+        hot_set = set(rng.sample(pvzs, n_hot))
+        pvz_weights = [hot_multiplier if p in hot_set else 1.0 for p in pvzs]
 
-def train_rule_tree(model, X_train, max_depth=6, min_samples_leaf=30):
-    """
-    Decision Tree обучается на предсказаниях LightGBM -> человекочитаемые правила,
-    которые затем исполняет диспетчер.
-    """
-    lgbm_labels = (model.predict_proba(X_train)[:, 1] > RISK_THRESHOLD).astype(int)
-    dt = DecisionTreeClassifier(
-        max_depth=max_depth, min_samples_leaf=min_samples_leaf, random_state=42
-    )
-    dt.fit(X_train, lgbm_labels)
-    fidelity = float((dt.predict(X_train) == lgbm_labels).mean())
-    rules = export_text(dt, feature_names=list(X_train.columns))
-    return dt, rules, fidelity
+    def sample_destination():
+        if pvz_weights is None:
+            return rng.choice(pvzs)
+        return rng.choices(pvzs, weights=pvz_weights, k=1)[0]
 
+    # Вес прогноза в стоимости рёбер (Layer 3). Действует только при наличии
+    # диспетчера: тогда в узлы пишется pred_risk и Дейкстра обходит будущие пробки.
+    graph.graph["risk_weight"] = risk_weight if dispatcher is not None else 0.0
 
-def run_mode(base_graph, seed, mode, model=None, rule_tree=None, explainer=None):
-    g = copy.deepcopy(base_graph)
-    dispatcher = None
-    use_reroute = True
-    if mode == "passive":
-        use_reroute = False
-    elif mode == "ai":
-        dispatcher = AIDispatcher(
-            model, rule_tree=rule_tree, risk_threshold=RISK_THRESHOLD, explainer=explainer
-        )
+    update_node_loads(graph)
+    if dispatcher is not None:
+        dispatcher.reset(graph)
 
-    df, orders, actions = simulate_with_dispatcher(
-        g, dispatcher=dispatcher, use_reroute=use_reroute,
-        proactive_reroute_fraction=PROACTIVE_FRACTION,
-        risk_weight=RISK_WEIGHT,
-        n_steps=N_STEPS, seed=seed, **REGIME,
-    )
-    metrics = {
-        "overload_rate": float(df["is_overload"].mean()),
-        "mean_load_ratio": float(df["load_ratio"].mean()),
-        "max_load_ratio": float(df["load_ratio"].max()),
-        "delivery_rate": float(df["delivered_orders"].max() / max(len(orders), 1)),
-    }
-    return metrics, actions, df, dispatcher
+    actions_log = {"reroute": 0, "pvz_switch": 0, "priority_boost": 0, "proactive_reroute": 0}
 
+    for step in range(n_steps):
+        # 1. Новые заказы
+        n_new_orders = rng.randint(min_orders_per_step, max_orders_per_step)
+        for _ in range(n_new_orders):
+            start = rng.choice(whs)
+            end = sample_destination()
+            path = find_path(graph, start, end, start_search=True)
+            while path is None:
+                start = rng.choice(whs)
+                end = sample_destination()
+                path = find_path(graph, start, end, start_search=True)
+            new_order = Order(order_id=order_id, start_point=start, end_point=end, path=path)
+            orders.append(new_order)
+            order_id += 1
+            graph.nodes[start]["queue"].append(new_order)
 
-def main():
-    random.seed(0)
-    np.random.seed(0)
+        update_node_loads(graph)
 
-    base_graph = build_network(**NETWORK)
+        for node in graph.nodes:
+            for order in graph.nodes[node]["queue"]:
+                if not order.delivered and not order.stuck:
+                    order.queue_wait_time += 1
 
-    print("[1/3] Генерация обучающих данных (пассивный режим)...")
-    csv_path = generate_training_data(base_graph)
+        active_orders = sum(1 for o in orders if not o.delivered and not o.stuck)
+        delivered_orders = sum(1 for o in orders if o.delivered)
+        stuck_orders = sum(1 for o in orders if o.stuck)
 
-    print("[2/3] Обучение LightGBM + Decision Tree (исполняемые правила)...")
-    model, X_train = train_model(csv_path)
-    rule_tree, rules, fidelity = train_rule_tree(model, X_train)
-    print(f"[rules] Decision Tree fidelity к LightGBM: {fidelity:.3f}")
-    print("\n=== Исполняемые правила диспетчера (Decision Tree поверх LightGBM) ===")
-    print(rules)
-
-    try:
-        import shap
-        explainer = shap.TreeExplainer(model)
-    except Exception as exc:
-        print(f"[warn] SHAP недоступен ({exc}); объяснения пропущены")
-        explainer = None
-
-    print(f"[3/3] Сравнение passive / reactive / ai на {len(EVAL_SEEDS)} сценариях...")
-    rows = {"passive": [], "reactive": [], "ai": []}
-    total_actions = {}
-    last_ai_df, last_dispatcher = None, None
-
-    for seed in EVAL_SEEDS:
-        for mode in ("passive", "reactive", "ai"):
-            m, actions, df, disp = run_mode(
-                base_graph, seed, mode, model, rule_tree, explainer
+        # 2. AI предсказывает риски по узлам
+        risk = {}
+        if dispatcher is not None:
+            risk = dispatcher.predict_risk(
+                graph, step, active_orders, delivered_orders, stuck_orders
             )
-            rows[mode].append(m)
-            if mode == "ai":
-                for k, v in actions.items():
-                    total_actions[k] = total_actions.get(k, 0) + v
-                last_ai_df, last_dispatcher = df, disp
+            # Прогноз -> в веса графа: пишем pred_risk в узлы, чтобы объезд Дейкстра
+            # по cost_function глобально обходил узлы с высоким будущим риском.
+            for node_id, p in risk.items():
+                graph.nodes[node_id]["pred_risk"] = p
+            # 4c. Приоритет: пометить заказы, идущие в рискованные узлы
+            if use_priority:
+                for o in orders:
+                    if o.delivered or o.stuck:
+                        continue
+                    nxt = o.next_node()
+                    o.priority = int(nxt is not None and risk.get(nxt, 0.0) > dispatcher.risk_threshold)
 
-    avg = {mode: pd.DataFrame(r).mean() for mode, r in rows.items()}
-    comp = pd.DataFrame(avg)
-    comp["AI vs passive, %"] = (avg["passive"] - avg["ai"]) / avg["passive"].abs() * 100
-    comp["AI vs reactive, %"] = (avg["reactive"] - avg["ai"]) / avg["reactive"].abs() * 100
-    # для delivery_rate "улучшение" — это рост
-    for col in ("AI vs passive, %", "AI vs reactive, %"):
-        comp.loc["delivery_rate", col] *= -1
+        # Лог позиций заказов для визуализации
+        if order_log is not None:
+            active = [o for o in orders if not o.delivered and not o.stuck]
+            if len(active) > order_log_cap:
+                active = aux_rng.sample(active, order_log_cap)
+            snapshot = []
+            for o in active:
+                nn = o.next_node()
+                snapshot.append((o.current_node, nn if nn is not None else o.current_node))
+            order_log.append(snapshot)
 
-    print("\n=== Сравнение режимов (среднее по сценариям) ===")
-    print(comp.round(4).to_string())
+        incoming = {node: [] for node in graph.nodes}
 
-    print("\n=== Действия AI-диспетчера (суммарно по сценариям) ===")
-    for k, v in total_actions.items():
-        print(f"  {k:18s}: {v}")
+        for node in list(graph.nodes):
+            node_queue = graph.nodes[node]["queue"]
+            capacity = graph.nodes[node]["capacity"]
 
-    if explainer is not None and last_ai_df is not None:
-        last_step = last_ai_df[last_ai_df["time"] == last_ai_df["time"].max()]
-        hottest = last_step.loc[last_step["predicted_risk"].idxmax()]
-        node_id = hottest["node_id"]
-        print(f"\n=== SHAP: почему узел {node_id} в зоне риска "
-              f"(P(overload)={hottest['predicted_risk']:.2f}) ===")
-        for feat, val in last_dispatcher.explain(node_id, top_k=4):
-            direction = "повышает" if val > 0 else "снижает"
-            print(f"  {feat:18s}: {val:+.3f}  ({direction} риск)")
+            # 4c. Приоритет: высокоприоритетные заказы попадают в обработку первыми
+            if dispatcher is not None and use_priority:
+                node_queue = sorted(node_queue, key=lambda o: o.priority, reverse=True)
+                if any(o.priority for o in node_queue[:capacity]):
+                    actions_log["priority_boost"] += 1
 
+            orders_to_process = node_queue[:capacity]
+            graph.nodes[node]["queue"] = node_queue[capacity:]
 
-if __name__ == "__main__":
-    main()
+            for order in orders_to_process:
+                if order.delivered or order.stuck:
+                    continue
+
+                current_node = order.current_node
+                if current_node != node:
+                    continue
+
+                if current_node == order.end_point:
+                    order.delivered = True
+                    continue
+
+                # 4b. Смена ПВЗ: если целевой ПВЗ предсказан перегруженным
+                if (
+                    dispatcher is not None
+                    and use_pvz_switch
+                    and order.reroute_count < max_pvz_switches
+                    and risk.get(order.end_point, 0.0) > dispatcher.risk_threshold
+                ):
+                    alt = _pick_alt_pvz(graph, current_node, pvzs, risk, exclude=order.end_point)
+                    if alt is not None:
+                        new_path = find_path(graph, current_node, alt, start_search=False)
+                        if new_path is not None:
+                            order.end_point = alt
+                            order.change_path(new_path)
+                            actions_log["pvz_switch"] += 1
+
+                next_node = order.next_node()
+                if next_node is None:
+                    order.stuck = True
+                    continue
+
+                next_capacity = graph.nodes[next_node]["capacity"]
+                next_queue_len = len(graph.nodes[next_node]["queue"]) + len(incoming[next_node])
+                next_load_ratio = next_queue_len / next_capacity if next_capacity > 0 else INF
+
+                # 4a. Reroute: проактивно (по предсказанию) или реактивно (по факту пробки).
+                # Проактивно уводим лишь долю потока (proactive_reroute_fraction),
+                # чтобы разгрузить узел, но не перегрузить альтернативу ("стадность").
+                predicted_overload = (
+                    dispatcher is not None
+                    and risk.get(next_node, 0.0) > dispatcher.risk_threshold
+                    and aux_rng.random() < proactive_reroute_fraction
+                )
+                congested = next_load_ratio > reroute_threshold
+
+                if use_reroute and (predicted_overload or congested):
+                    new_path = find_path(
+                        graph,
+                        start_point=current_node,
+                        end_point=order.end_point,
+                        start_search=False,
+                        excluded_node=next_node,
+                    )
+                    if new_path is not None:
+                        order.change_path(new_path)
+                        next_node = order.next_node()
+                        actions_log["reroute"] += 1
+                        if predicted_overload and not congested:
+                            actions_log["proactive_reroute"] += 1
+                    else:
+                        incoming[current_node].append(order)
+                        continue
+
+                if next_node is None:
+                    order.stuck = True
+                    continue
+
+                if block_if_full:
+                    current_next_queue = len(graph.nodes[next_node]["queue"]) + len(incoming[next_node])
+                    if current_next_queue >= graph.nodes[next_node]["capacity"]:
+                        incoming[current_node].append(order)
+                        continue
+
+                order.path_index += 1
+                incoming[next_node].append(order)
+
+        for node, arrived_orders in incoming.items():
+            graph.nodes[node]["queue"].extend(arrived_orders)
+
+        update_node_loads(graph)
+        if dispatcher is not None:
+            dispatcher.update_history(graph)
+
+        active_orders = sum(1 for o in orders if not o.delivered and not o.stuck)
+        delivered_orders = sum(1 for o in orders if o.delivered)
+        stuck_orders = sum(1 for o in orders if o.stuck)
+
+        for node, attrs in graph.nodes(data=True):
+            pred_lr = [graph.nodes[p]["load_ratio"] for p in graph.predecessors(node)]
+            succ_lr = [graph.nodes[s]["load_ratio"] for s in graph.successors(node)]
+            history.append({
+                "time": step,
+                "node_id": node,
+                "node_type": attrs["type"],
+                "capacity": attrs["capacity"],
+                "queue": len(attrs["queue"]),
+                "load_ratio": attrs["load_ratio"],
+                "is_overload": int(attrs["is_overload"]),
+                "active_orders": active_orders,
+                "delivered_orders": delivered_orders,
+                "stuck_orders": stuck_orders,
+                "predicted_risk": risk.get(node, float("nan")),
+                "upstream_load": float(np.mean(pred_lr)) if pred_lr else 0.0,
+                "downstream_load": float(np.mean(succ_lr)) if succ_lr else 0.0,
+            })
+
+    return pd.DataFrame(history), orders, actions_log
