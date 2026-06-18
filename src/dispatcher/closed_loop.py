@@ -103,12 +103,24 @@ def simulate_with_dispatcher(
         for _ in range(n_new_orders):
             start = rng.choice(whs)
             end = sample_destination()
-            path = find_path(graph, start, end, start_search=True)
+            # В AI-режиме новый заказ сразу строит маршрут через cost_function:
+            # pred_risk от предыдущего шага уже записан в узлы, поэтому заказ
+            # изначально обходит узлы с нарастающим трендом, а не только базовое время.
+            # В baseline-режиме (dispatcher=None) используем только base_time — поведение прежнее.
+            use_cost = dispatcher is not None
+            path = find_path(graph, start, end, start_search=not use_cost)
             while path is None:
                 start = rng.choice(whs)
                 end = sample_destination()
-                path = find_path(graph, start, end, start_search=True)
-            new_order = Order(order_id=order_id, start_point=start, end_point=end, path=path)
+                path = find_path(graph, start, end, start_search=not use_cost)
+            eta = sum(
+                graph[path[i]][path[i + 1]]["base_time"]
+                for i in range(len(path) - 1)
+            )
+            new_order = Order(
+                order_id=order_id, start_point=start, end_point=end,
+                path=path, created_at=step, initial_eta=eta,
+            )
             orders.append(new_order)
             order_id += 1
             graph.nodes[start]["queue"].append(new_order)
@@ -178,6 +190,7 @@ def simulate_with_dispatcher(
 
                 if current_node == order.end_point:
                     order.delivered = True
+                    order.delivered_at = step
                     continue
 
                 # 4b. Смена ПВЗ: если целевой ПВЗ предсказан перегруженным
@@ -205,12 +218,11 @@ def simulate_with_dispatcher(
                 next_load_ratio = next_queue_len / next_capacity if next_capacity > 0 else INF
 
                 # 4a. Reroute: проактивно (по предсказанию) или реактивно (по факту пробки).
-                # Проактивно уводим лишь долю потока (proactive_reroute_fraction),
-                # чтобы разгрузить узел, но не перегрузить альтернативу ("стадность").
+                node_risk = risk.get(next_node, 0.0)
                 predicted_overload = (
                     dispatcher is not None
-                    and risk.get(next_node, 0.0) > dispatcher.risk_threshold
-                    and aux_rng.random() < proactive_reroute_fraction
+                    and node_risk > dispatcher.risk_threshold
+                    and aux_rng.random() < min(node_risk, proactive_reroute_fraction)
                 )
                 congested = next_load_ratio > reroute_threshold
 
@@ -223,14 +235,22 @@ def simulate_with_dispatcher(
                         excluded_node=next_node,
                     )
                     if new_path is not None:
-                        order.change_path(new_path)
-                        next_node = order.next_node()
-                        actions_log["reroute"] += 1
-                        if predicted_overload and not congested:
-                            actions_log["proactive_reroute"] += 1
-                    else:
+                        new_next = new_path[1] if len(new_path) > 1 else None
+                        # Рероутим только если альтернатива реально лучше текущего узла.
+                        # Иначе заказ продолжает идти по прежнему пути — не стоит на месте,
+                        # просто без смены маршрута.
+                        if new_next is None or risk.get(new_next, 0.0) < risk.get(next_node, 0.0):
+                            order.change_path(new_path)
+                            next_node = order.next_node()
+                            actions_log["reroute"] += 1
+                            if predicted_overload and not congested:
+                                actions_log["proactive_reroute"] += 1
+                        # else: альтернатива хуже или равна — продолжаем по исходному пути
+                    elif congested:
+                        # Физически нет пути И узел уже заблокирован — остаёмся в очереди.
                         incoming[current_node].append(order)
                         continue
+                    # predicted_overload, но пути нет → продолжаем по исходному пути
 
                 if next_node is None:
                     order.stuck = True

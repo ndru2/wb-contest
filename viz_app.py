@@ -31,20 +31,21 @@ from src.dispatcher.closed_loop import simulate_with_dispatcher
 
 
 FEATURE_RU = {
-    "node_type_code": "тип узла",
-    "capacity": "ёмкость",
-    "queue": "очередь",
-    "load_ratio": "загрузка",
-    "congestion": "затор",
-    "active_orders": "активных заказов",
+    "node_type_code":   "тип узла (склад / хаб / ПВЗ)",
+    "capacity":         "ёмкость узла",
+    "queue":            "длина очереди сейчас",
+    "load_ratio":       "текущая загрузка (очередь / ёмкость)",
+    "active_orders":    "заказов в сети прямо сейчас",
     "delivered_orders": "доставлено всего",
-    "stuck_orders": "застряло всего",
-    "load_ratio_lag1": "загрузка 1 шаг назад",
-    "load_ratio_lag2": "загрузка 2 шага назад",
-    "load_ratio_lag3": "загрузка 3 шага назад",
-    "queue_delta": "прирост очереди",
-    "upstream_load": "загрузка источников (склады/хабы выше)",
-    "downstream_load": "загрузка получателей (хабы/ПВЗ ниже)",
+    "stuck_orders":     "застряло всего",
+    "load_ratio_lag1":  "загрузка 1 шаг назад",
+    "load_ratio_lag2":  "загрузка 2 шага назад",
+    "load_ratio_lag3":  "загрузка 3 шага назад (тренд)",
+    "queue_delta":      "прирост очереди за шаг",
+    "growth_rate":      "скорость роста очереди / ёмкость",
+    "delta2":           "ускорение роста очереди",
+    "upstream_load":    "загрузка источников (склады/хабы выше)",
+    "downstream_load":  "загрузка получателей (хабы/ПВЗ ниже)",
 }
 
 
@@ -332,7 +333,7 @@ def main():
 
     st.title("📦 Динамическая симуляция логистики: без диспетчера vs AI-диспетчер")
     st.caption("Домики — узлы сети (🏭 склад · 🏢 хаб · 🏠 ПВЗ). 🚆 — заказы на дорогах. "
-               "💥 — перегрузка узла (queue > capacity).")
+               "💥 — перегрузка узла.")
 
     if st.session_state["demo_result"] is None:
         with st.spinner("Создаю модель и считаю симуляцию..."):
@@ -353,35 +354,40 @@ def main():
 
     st.plotly_chart(fig, use_container_width=True)
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1, c2, c3, c4, c5 = st.columns(5)
     hop, hoa = summary["hub_overload_rate"]
     mlp, mla = summary["mean_hub_load"]
     mxp, mxa = summary["max_load_ratio"]
     dp, da = summary["delivered"]
     mtp, mta = summary["mean_queue_wait"]
-    rp, ra = summary["reroutes"]
     c1.metric("Перегрузки хабов", f"{hoa:.1%}", f"{(hoa - hop):.1%} vs без AI", delta_color="inverse")
     c2.metric("Средняя загрузка хабов", f"{mla:.2f}", f"{(mla - mlp):.2f} vs без AI", delta_color="inverse")
     c3.metric("Пиковая загрузка", f"{mxa:.2f}×", f"{(mxa - mxp):.2f} vs без AI", delta_color="inverse")
     c4.metric("Доставлено заказов", f"{da}", f"{da - dp} vs без AI")
-    c5.metric("Среднее время в очереди обработки", f"{mta:.2f}", f"{(mta - mtp):.2f} vs без AI", delta_color="inverse")
-    c6.metric("Перемаршруты", f"{ra}", f"без AI: {rp}")
-    st.caption("Перегрузки считаются по хабам — это узкое место сети (склады и ПВЗ имеют "
-               "запас ёмкости). По всей сети доля перегрузок: "
+    c5.metric("Среднее время в очереди", f"{mta:.2f}", f"{(mta - mtp):.2f} vs без AI",
+              delta_color="inverse"
+              )
+    st.caption("Перегрузки считаются по хабам, склады и ПВЗ имеют "
+               "запас ёмкости. По всей сети доля перегрузок: "
                f"без AI {summary['overload_rate'][0]:.3f} → с AI {summary['overload_rate'][1]:.3f}.")
 
-    st.subheader("📋 Правила, которые исполняет диспетчер")
-    st.caption(f"Decision Tree обучен на предсказаниях LightGBM (fidelity {fidelity:.3f}). "
-               "Каждое правило — путь в дереве, ведущий к высокому риску перегрузки:")
-    if human_rules:
-        for r in human_rules:
-            st.markdown(f"- {r}")
-    else:
-        st.info("В текущем режиме дерево не выделило правил выше порога риска.")
+    # ── Объяснение метрик ────────────────────────────────────────────────
+    with st.expander("📖 Что означают метрики"):
+        st.markdown("""
+| Метрика | Что измеряет |
+|---|---|
+| **Перегрузки хабов** | Доля шагов, когда хотя бы один хаб превысил ёмкость |
+| **Средняя загрузка хабов** | Среднее отношение очереди к ёмкости по всем хабам |
+| **Пиковая загрузка** | Максимальная загрузка самого нагруженного узла за всю симуляцию |
+| **Доставлено заказов** | Количество заказов, которые достигли своего ПВЗ |
+| **Среднее время в очереди** | Среднее число шагов, которое заказ провёл в ожидании обработки |
 
-    with st.expander("⚙️ Действия диспетчера и полное дерево (export_text)"):
-        st.write({k: int(v) for k, v in actions.items()})
-        st.code(rules)
+
+> **Хабы** — узкое место сети: их ёмкость намеренно ограничена. Склады и ПВЗ
+> имеют запас ёмкости, поэтому ключевые метрики считаются именно по хабам.
+        """)
+
+
 
 
 if __name__ == "__main__":

@@ -20,6 +20,9 @@ class Order:
     reroute_count: int = 0
     priority: int = 0
     queue_wait_time: int = 0
+    created_at: int = 0
+    delivered_at: int = -1
+    initial_eta: float = 0.0
 
     @property
     def current_node(self):
@@ -147,18 +150,19 @@ def cost_function(graph, start_node, end_node):
     base_time = graph[start_node][end_node]["base_time"]
 
     load_ratio = queue / capacity if capacity > 0 else INF
-    congestion = load_ratio * 3.0
-
-    # Прогноз модели в весах графа (Layer 3 — балансировка по предсказанию):
-    # pred_risk = P(overload) целевого узла, risk_weight задаётся на уровне графа.
-    # По умолчанию (нет диспетчера) pred_risk=0 и risk_weight=0 => поведение прежнее.
     risk_weight = graph.graph.get("risk_weight", 0.0)
     pred_risk = graph.nodes[end_node].get("pred_risk", 0.0)
-    risk_penalty = risk_weight * pred_risk
 
-    new_cost = base_time + congestion + risk_penalty
+    if risk_weight > 0.0:
+        # AI-режим: congestion = P(overload) × risk_weight.
+        # pred_risk уже содержит load_ratio_lag, upstream_load, delta2 —
+        # Дейкстра обходит узлы с нарастающим трендом, а не только уже перегруженные.
+        congestion = risk_weight * pred_risk
+    else:
+        # Базовый/реактивный режим: штраф по текущей загрузке.
+        congestion = load_ratio * 3.0
 
-    return new_cost
+    return base_time + congestion
 
 def find_path(graph, start_point, end_point, start_search=True, excluded_node=None):
     if start_search:
